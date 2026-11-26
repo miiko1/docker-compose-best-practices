@@ -259,28 +259,22 @@ secrets/
 .env
 .env.*
 secrets/
-
-```javascript
+```
 
 Add language-specific caches, test output, local data, and other files that are not needed in the build context. Do not bake secret files into an image.
 
 ## Setup and validation
 
-```
-
+```bash
 # 1. Create local configuration and a development-only database password.
-
 cp .env.example .env
 umask 077
 mkdir -p secrets
 openssl rand -base64 32 > secrets/db_password.txt
 
 # File-backed secrets are bind mounts. For this rootful local-Docker example,
-
 # let the app's UID/GID own the file; the PostgreSQL entrypoint starts as root.
-
 # Adapt ownership to your container users and rootful/rootless Docker setup.
-
 sudo chown 10001:10001 secrets/db_password.txt
 sudo chmod 0400 secrets/db_password.txt
 
@@ -293,13 +287,11 @@ docker compose -f compose.yaml -f compose.dev.yaml config
 # 4. Start local development with build and file watching.
 
 docker compose -f compose.yaml -f compose.dev.yaml up --build --watch
-
-```javascript
+```
 
 For production:
 
-```
-
+```bash
 # Validate and inspect the resolved model before pulling or changing services.
 
 docker compose \
