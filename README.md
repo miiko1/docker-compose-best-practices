@@ -2,7 +2,7 @@
 
 ## Scope
 
-This template targets a current Docker Compose v2 release on Linux, usually on a single host. Some fields, including `develop.watch`, are unavailable in early v2 releases. The examples use an application plus PostgreSQL; replace the image names, ports, health check, watch paths, and resource limits with values appropriate for your application.
+This template targets Docker Compose v2 on Linux, usually on a single host. Use a current release for security fixes and bug fixes; Compose 2.22.0 or later is required for `develop.watch`. The examples use an application plus PostgreSQL; replace the image names, ports, health check, watch paths, and resource limits with values appropriate for your application.
 
 A Compose file alone does not provide production readiness. You still need TLS and firewall configuration, host patching, image scanning, monitoring, secret rotation, tested backups, and a rollback procedure. Swarm and Kubernetes also have different deployment and secret semantics.
 
@@ -17,7 +17,7 @@ A Compose file alone does not provide production readiness. You still need TLS a
 7. **Preserve and protect data.** Use named volumes for persistent state. Keep volume lifecycle separate from application deployment, test backup and restore procedures, and never use `docker compose down -v` as a routine cleanup command.
 8. **Bound resource use and logs.** Set CPU, memory, and PID limits based on measurements. Configure log rotation or forwarding, emit structured application logs to stdout/stderr, and monitor health, disk usage, restarts, and resource pressure.
 9. **Handle lifecycle deliberately.** Support `SIGTERM`, allow a sensible stop grace period, run migrations as controlled one-shot operations, and design safe deployment and rollback steps.
-10. **Validate the resolved model.** Run `docker compose config` in CI and before deployment to inspect merged files and interpolation. Review remote `include` or `extends` content before executing it; pin remote references to digests where possible.
+10. **Validate the resolved model.** Treat every Compose file as trusted code: review its source and all remote `include` or `extends` dependencies before running any Compose command, and pin remote references to digests where possible. Then run `docker compose config` in CI and before deployment to inspect merged files and interpolation. `config` is not a sandbox or security scanner for untrusted input.
 
 ## Suggested project layout
 
@@ -78,12 +78,13 @@ services:
       DB_HOST: db
       DB_PORT: "5432"
       DB_NAME: ${POSTGRES_DB:-app}
-      DB_USER: ${POSTGRES_USER:-app}
+      # Defaults match the local initialization role; use a separate role in prod.
+      DB_USER: ${APP_DB_USER:-app}
       # Your application must implement reading this file.
-      DB_PASSWORD_FILE: /run/secrets/db_password
+      DB_PASSWORD_FILE: /run/secrets/app_db_password
 
     secrets:
-      - db_password
+      - app_db_password
 
     depends_on:
       db:
@@ -128,6 +129,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    # Example only: tune this to measured checkpoint and shutdown duration.
+    stop_grace_period: 60s
     networks:
       - data
     # Intentionally no host "ports:" entry for PostgreSQL.
@@ -144,11 +147,14 @@ networks:
 secrets:
   db_password:
     file: ${DB_PASSWORD_FILE:-./secrets/db_password.txt}
+  app_db_password:
+    # Local development shares the password file; use a distinct file in prod.
+    file: ${APP_DB_PASSWORD_FILE:-./secrets/db_password.txt}
 ```
 
 The volume target follows the [PostgreSQL image's PostgreSQL 18+ layout](https://hub.docker.com/_/postgres#pgdata): `PGDATA` is `/var/lib/postgresql/18/docker` for PostgreSQL 18, while the volume is mounted at `/var/lib/postgresql`. PostgreSQL 17 and earlier use `/var/lib/postgresql/data` instead. Do not point a different PostgreSQL major version at an existing data directory and treat it as an in-place upgrade; back up the database and follow the image's `pg_upgrade` guidance.
 
-The [official image](https://hub.docker.com/_/postgres#postgres_user) creates `POSTGRES_USER` as a **superuser**. This compact example reuses that initialization role for the application so it can run without a separate provisioning script. Before production use, provision a separate least-privileged application role with its own secret, and grant only the privileges it needs; use separate migration and runtime roles where practical.
+The [official image](https://hub.docker.com/_/postgres#postgres_user) creates `POSTGRES_USER` as a **superuser**. The local defaults reuse that initialization role and password file so the example needs no separate provisioning script. Before production use, provision a separate least-privileged application role, grant only the privileges it needs, and set `APP_DB_USER` and `APP_DB_PASSWORD_FILE` to that role and its distinct secret. Use separate migration and runtime roles where practical. The two Compose secrets have independent names so production can grant the application and database different files without changing the service definitions.
 
 ## `compose.dev.yaml`
 
@@ -176,7 +182,7 @@ services:
         # Also add dependency manifests/lockfiles that require a rebuild.
 ```
 
-Run development explicitly with both files so a conventionally named override cannot accidentally weaken a production deployment.
+Run development explicitly with both files so a conventionally named override cannot accidentally weaken a production deployment. Compose Watch also requires `stat`, `mkdir`, and `rmdir` in the development image, and its sync target must be writable by the container user.
 
 ## `compose.production.yaml`
 
@@ -227,6 +233,9 @@ LOG_LEVEL=debug
 POSTGRES_DB=app
 POSTGRES_USER=app
 DB_PASSWORD_FILE=./secrets/db_password.txt
+# Local defaults share the initialization role and password file.
+APP_DB_USER=app
+APP_DB_PASSWORD_FILE=./secrets/db_password.txt
 ```
 
 Use a separate, protected `.env.production` for deployment. It should set at least:
@@ -237,11 +246,14 @@ POSTGRES_IMAGE=postgres:18@sha256:REPLACE_WITH_REVIEWED_DIGEST
 APP_BIND=127.0.0.1
 APP_PORT=8080
 POSTGRES_DB=app
-POSTGRES_USER=app
-DB_PASSWORD_FILE=/secure/path/db_password.txt
+POSTGRES_USER=postgres
+DB_PASSWORD_FILE=/secure/path/postgres_password.txt
+# Provision this least-privileged role before deployment; initialization does not create it.
+APP_DB_USER=app_runtime
+APP_DB_PASSWORD_FILE=/secure/path/app_runtime_password.txt
 ```
 
-Changing `POSTGRES_USER`, `POSTGRES_DB`, or the password file does not rotate credentials in an already initialized PostgreSQL volume; those variables primarily initialize a new database. Plan credential rotation separately.
+Changing `POSTGRES_USER`, `POSTGRES_DB`, `APP_DB_USER`, or a password file does not create roles or rotate credentials in an already initialized PostgreSQL volume. The PostgreSQL image's initialization variables primarily affect a new, empty data directory; the application variables only tell the application what to use. Provision and rotate roles separately, then update the relevant secrets and restart or recreate their consumers.
 
 ## `.gitignore`
 
@@ -304,10 +316,11 @@ docker compose \
 -f compose.yaml -f compose.production.yaml \
 pull
 
+# Adjust the timeout to the slowest expected startup; avoid waiting forever.
 docker compose \
 --env-file .env.production \
 -f compose.yaml -f compose.production.yaml \
-up -d --wait
+up -d --wait --wait-timeout 120
 
 docker compose \
 --env-file .env.production \
