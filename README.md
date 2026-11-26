@@ -1,25 +1,130 @@
-# Docker Compose stack: best practices and reusable template
+# Docker Compose best practices and reusable template
 
-## Scope
+A practical, security-conscious starting point for running an application and PostgreSQL with Docker Compose v2 on a single Linux host. Use the annotated examples to separate development and production settings, protect secrets and data, and validate the resolved Compose model before deployment.
 
-This template targets Docker Compose v2 on Linux, usually on a single host. Use a current release for security fixes and bug fixes; Compose 2.22.0 or later is required for `develop.watch`. The examples use an application plus PostgreSQL; replace the image names, ports, health check, watch paths, and resource limits with values appropriate for your application.
+**This repository is a guide and annotated template, not a ready-to-run application.** Copy the examples into your application repository and replace the application-specific image, port, health check, watch paths, credentials, and resource limits before starting the stack.
 
-A Compose file alone does not provide production readiness. You still need TLS and firewall configuration, host patching, image scanning, monitoring, secret rotation, tested backups, and a rollback procedure. Swarm and Kubernetes also have different deployment and secret semantics.
+## Contents
+
+- [What this template provides](#what-this-template-provides)
+- [Scope and requirements](#scope-and-requirements)
+- [Quick start](#quick-start)
+- [Best-practice checklist](#best-practice-checklist)
+- [Template files](#template-files)
+- [Production deployment](#production-deployment)
+- [Verification and troubleshooting](#verification-and-troubleshooting)
+- [Production review questions](#production-review-questions)
+- [Contributing](#contributing)
+- [Support](#support)
+- [License](#license)
+- [Official references](#official-references)
+
+## What this template provides
+
+- A production-safe base Compose file with non-root execution, dropped capabilities, a read-only root filesystem, health checks, private database networking, persistent storage, and log rotation.
+- Separate development and production overrides so local conveniences do not silently weaken a deployment.
+- File-backed secret examples with explicit guidance about permissions, ownership, and production secret managers.
+- Environment-file examples that distinguish Compose interpolation from container environment variables.
+- Development, validation, deployment, and troubleshooting commands with safety notes for destructive operations.
+- A production review checklist and links to official Docker and PostgreSQL documentation.
+
+## Scope and requirements
+
+This template targets Docker Compose v2 on Linux, usually on a single host. Swarm and Kubernetes have different deployment and secret semantics and are outside its scope.
+
+Before using the examples, make sure you have:
+
+- A supported Docker Engine installation with the Docker Compose v2 plugin.
+- Compose 2.22.0 or later if you use `develop.watch`.
+- An application image or Dockerfile that you can adapt to the template.
+- Basic familiarity with containers, environment variables, ports, and volumes.
+
+Check the installed Compose version:
+
+```bash
+docker compose version
+```
+
+The examples use an application plus PostgreSQL 18. Replace the PostgreSQL major tag and volume target if you use another supported version; do not point a different major version at an existing data directory as an in-place upgrade.
+
+### Application assumptions to adapt
+
+| Setting | Template default | Required adaptation |
+| --- | --- | --- |
+| Application image | `myapp:local` | Use your development image and an approved immutable production reference. |
+| Container port | `8080` | Match the port on which your application listens. |
+| Health check | `/app/healthcheck` | Provide an executable in the image that tests real readiness and exits `0` on success. |
+| Container user | `10001:10001` | Use a non-root user that exists in the image and can access required files and writable paths. |
+| Database password | `DB_PASSWORD_FILE=/run/secrets/app_db_password` | Configure the application to read the password from this file, or change the environment contract. |
+| Watch paths | `./src` and `./Dockerfile` | Match your source tree and rebuild triggers. |
+
+A Compose file alone does not provide production readiness. You still need TLS and firewall configuration, host patching, image scanning, monitoring, secret rotation, tested backups, and a rollback procedure.
+
+## Quick start
+
+The shortest reliable path is to adapt the template in an existing application repository, validate it, and then start the development stack.
+
+1. In your application repository, create the files shown in [Suggested project layout](#suggested-project-layout). Copy their contents from [Template files](#template-files), then update every application-specific value listed above.
+2. Create local configuration and a development-only database password:
+
+   ```bash
+   cp .env.example .env
+   umask 077
+   mkdir -p secrets
+   openssl rand -base64 32 > secrets/db_password.txt
+   ```
+
+3. Make the secret readable by the intended container users. For this rootful local-Docker example, let the application's UID/GID own the file; the PostgreSQL entrypoint starts as root:
+
+   ```bash
+   sudo chown 10001:10001 secrets/db_password.txt
+   sudo chmod 0400 secrets/db_password.txt
+   ```
+
+   Adapt ownership to your container users and rootful or rootless Docker setup. File-backed secrets are bind mounts, not an encrypted external secret store.
+
+4. Inspect the fully merged and interpolated development model:
+
+   ```bash
+   docker compose -f compose.yaml -f compose.dev.yaml config
+   ```
+
+   Review the output before continuing. Do not publish it as a CI artifact if it contains resolved configuration that should remain private.
+
+5. Start local development with build and file watching:
+
+   ```bash
+   docker compose -f compose.yaml -f compose.dev.yaml up --build --watch
+   ```
+
+6. In another terminal, verify service status:
+
+   ```bash
+   docker compose -f compose.yaml -f compose.dev.yaml ps
+   ```
+
+   After startup, both services should report a healthy status. If your application serves HTTP, it should be reachable at the configured `APP_BIND` and `APP_PORT` (by default, `http://127.0.0.1:8080`). If startup fails, use [Verification and troubleshooting](#verification-and-troubleshooting).
+
+Compose Watch requires `stat`, `mkdir`, and `rmdir` in the development image. Its sync target must also be writable by the container user.
 
 ## Best-practice checklist
 
 1. **Make deployments reproducible.** Omit the obsolete top-level `version:` field. Give the project a name, avoid fixed `container_name` values, and use reviewed image tags or immutable digests rather than `latest`. Treat digest updates as reviewed code changes.
-2. **Keep the base file production-safe.** Put local builds, source synchronization, debug settings, and other developer conveniences in `compose.dev.yaml`. Put immutable images, restart policy, and measured resource limits in `compose.production.yaml`. Use `include` for modular ownership, not as a substitute for environment overrides.
+2. **Keep the base file production-safe.** Put local builds, source synchronization, debug settings, and other developer conveniences in `compose.dev.yaml`. Put immutable images, restart policies, and measured resource limits in `compose.production.yaml`. Use `include` for modular ownership, not as a substitute for environment overrides.
 3. **Separate configuration from secrets.** Use `.env` files for Compose interpolation and non-secret settings. Explicitly pass container environment variables with `environment` or `env_file`; a root `.env` file is not automatically injected into every container. Grant secrets only to services that need them. Plain Compose bind-mounts `file:` secrets from the host; it does not turn them into an externally managed, encrypted secret store.
 4. **Use least privilege.** Build small, multi-stage images and run as a non-root user. Where supported by the application, use a read-only root filesystem, a small writable `tmpfs`, `no-new-privileges`, and dropped Linux capabilities. Do not enable `privileged`, host networking, or broad host bind mounts without a documented need.
 5. **Expose only what is necessary.** Use service names for internal DNS. Keep databases off host ports and place them on an internal network. Bind application ports to localhost when a same-host reverse proxy provides external access.
 6. **Model readiness and failure.** Add meaningful health checks and use `depends_on` with `service_healthy`. Add restart policies for long-running services, but remember that an unhealthy status alone does not make plain Compose restart a container. Applications must still use timeouts, retries with backoff, and reconnection logic.
 7. **Preserve and protect data.** Use named volumes for persistent state. Keep volume lifecycle separate from application deployment, test backup and restore procedures, and never use `docker compose down -v` as a routine cleanup command.
-8. **Bound resource use and logs.** Set CPU, memory, and PID limits based on measurements. Configure log rotation or forwarding, emit structured application logs to stdout/stderr, and monitor health, disk usage, restarts, and resource pressure.
+8. **Bound resource use and logs.** Set CPU, memory, and PID limits based on measurements. Configure log rotation or forwarding, emit structured application logs to stdout and stderr, and monitor health, disk usage, restarts, and resource pressure.
 9. **Handle lifecycle deliberately.** Support `SIGTERM`, allow a sensible stop grace period, run migrations as controlled one-shot operations, and design safe deployment and rollback steps.
 10. **Validate the resolved model.** Treat every Compose file as trusted code: review its source and all remote `include` or `extends` dependencies before running any Compose command, and pin remote references to digests where possible. Then run `docker compose config` in CI and before deployment to inspect merged files and interpolation. `config` is not a sandbox or security scanner for untrusted input.
 
-## Suggested project layout
+## Template files
+
+### Suggested project layout
+
+Create these files in your application repository, not as siblings of this guide's checkout:
 
 ```text
 .
@@ -36,9 +141,11 @@ A Compose file alone does not provide production readiness. You still need TLS a
     └── db_password.txt          # Local development only; do not commit
 ```
 
-For a larger production deployment, replace file-backed development secrets with your platform's secret manager or externally managed secrets. For `file:` secrets, Docker Compose ignores service-level `uid`, `gid`, and `mode` settings because it uses a bind mount; set suitably restrictive ownership and permissions on the source file and verify that every intended container user can read it.
+For a larger production deployment, replace file-backed development secrets with your platform's secret manager or externally managed secrets. For `file:` secrets, Docker Compose ignores service-level `uid`, `gid`, and `mode` settings because it uses a bind mount. Set suitably restrictive ownership and permissions on the source file and verify that every intended container user can read it.
 
-## `compose.yaml`
+### Base Compose file
+
+Save as `compose.yaml`:
 
 ```yaml
 # Compose v2: do not add the obsolete top-level "version:" field.
@@ -156,7 +263,9 @@ The volume target follows the [PostgreSQL image's PostgreSQL 18+ layout](https:/
 
 The [official image](https://hub.docker.com/_/postgres#postgres_user) creates `POSTGRES_USER` as a **superuser**. The local defaults reuse that initialization role and password file so the example needs no separate provisioning script. Before production use, provision a separate least-privileged application role, grant only the privileges it needs, and set `APP_DB_USER` and `APP_DB_PASSWORD_FILE` to that role and its distinct secret. Use separate migration and runtime roles where practical. The two Compose secrets have independent names so production can grant the application and database different files without changing the service definitions.
 
-## `compose.dev.yaml`
+### Development override
+
+Save as `compose.dev.yaml`:
 
 ```yaml
 services:
@@ -179,12 +288,14 @@ services:
           target: /app/src
         - action: rebuild
           path: ./Dockerfile
-        # Also add dependency manifests/lockfiles that require a rebuild.
+        # Also add dependency manifests and lockfiles that require a rebuild.
 ```
 
-Run development explicitly with both files so a conventionally named override cannot accidentally weaken a production deployment. Compose Watch also requires `stat`, `mkdir`, and `rmdir` in the development image, and its sync target must be writable by the container user.
+Run development explicitly with both files so a conventionally named override cannot accidentally weaken a production deployment.
 
-## `compose.production.yaml`
+### Production override
+
+Save as `compose.production.yaml`:
 
 ```yaml
 services:
@@ -218,9 +329,9 @@ services:
 
 The resource values are examples, not recommendations for every workload. Measure normal and peak behavior before setting them; an overly low memory limit can cause out-of-memory kills. Do not add replicas blindly: stateful services, fixed host ports, session handling, and reverse-proxy configuration all affect whether scaling is safe.
 
-## `.env.example`
+### Environment files
 
-Commit only safe example values.
+Save as `.env.example` and commit only safe example values:
 
 ```dotenv
 # Local development defaults
@@ -255,7 +366,9 @@ APP_DB_PASSWORD_FILE=/secure/path/app_runtime_password.txt
 
 Changing `POSTGRES_USER`, `POSTGRES_DB`, `APP_DB_USER`, or a password file does not create roles or rotate credentials in an already initialized PostgreSQL volume. The PostgreSQL image's initialization variables primarily affect a new, empty data directory; the application variables only tell the application what to use. Provision and rotate roles separately, then update the relevant secrets and restart or recreate their consumers.
 
-## `.gitignore`
+### Ignore files
+
+Save as `.gitignore`:
 
 ```gitignore
 .env
@@ -264,7 +377,7 @@ Changing `POSTGRES_USER`, `POSTGRES_DB`, `APP_DB_USER`, or a password file does 
 secrets/
 ```
 
-## `.dockerignore`
+Save as `.dockerignore`:
 
 ```dockerignore
 .git
@@ -275,83 +388,123 @@ secrets/
 
 Add language-specific caches, test output, local data, and other files that are not needed in the build context. Do not bake secret files into an image.
 
-## Setup and validation
+## Production deployment
+
+Before deployment, replace every placeholder, provision distinct database roles and secrets, pin reviewed images, and set resource limits from measurements.
+
+1. Validate and inspect the resolved model before pulling images or changing services:
+
+   ```bash
+   docker compose \
+     --env-file .env.production \
+     -f compose.yaml -f compose.production.yaml \
+     config
+   ```
+
+2. Pull the reviewed images:
+
+   ```bash
+   docker compose \
+     --env-file .env.production \
+     -f compose.yaml -f compose.production.yaml \
+     pull
+   ```
+
+3. Start services and wait for health checks. Adjust the timeout to the slowest expected startup instead of waiting forever:
+
+   ```bash
+   docker compose \
+     --env-file .env.production \
+     -f compose.yaml -f compose.production.yaml \
+     up -d --wait --wait-timeout 120
+   ```
+
+4. Verify the resulting service status:
+
+   ```bash
+   docker compose \
+     --env-file .env.production \
+     -f compose.yaml -f compose.production.yaml \
+     ps
+   ```
+
+To remove containers and networks when intentionally decommissioning the stack, run:
 
 ```bash
-# 1. Create local configuration and a development-only database password.
-cp .env.example .env
-umask 077
-mkdir -p secrets
-openssl rand -base64 32 > secrets/db_password.txt
-
-# File-backed secrets are bind mounts. For this rootful local-Docker example,
-# let the app's UID/GID own the file; the PostgreSQL entrypoint starts as root.
-# Adapt ownership to your container users and rootful/rootless Docker setup.
-sudo chown 10001:10001 secrets/db_password.txt
-sudo chmod 0400 secrets/db_password.txt
-
-# 2. Update the app health-check command and development watch paths.
-
-# 3. Inspect the fully merged/interpolated development model.
-
-docker compose -f compose.yaml -f compose.dev.yaml config
-
-# 4. Start local development with build and file watching.
-
-docker compose -f compose.yaml -f compose.dev.yaml up --build --watch
+docker compose \
+  --env-file .env.production \
+  -f compose.yaml -f compose.production.yaml \
+  down
 ```
 
-For production:
+**Do not routinely add `-v` to `down`.** It deletes named volumes declared by this Compose project, including `db_data`. Keep volume deletion and data recovery as separate, deliberate operations.
+
+Be cautious about storing `docker compose config` output as a public CI artifact: it reveals resolved configuration and exposes anything mistakenly supplied as a sensitive environment variable.
+
+## Verification and troubleshooting
+
+### Routine checks
+
+Run these checks after changing the template:
 
 ```bash
-# Validate and inspect the resolved model before pulling or changing services.
+# Validate interpolation and the merged development model without printing it.
+docker compose -f compose.yaml -f compose.dev.yaml config --quiet
 
-docker compose \
---env-file .env.production \
--f compose.yaml -f compose.production.yaml \
-config
+# Inspect service health and published ports.
+docker compose -f compose.yaml -f compose.dev.yaml ps
 
-docker compose \
---env-file .env.production \
--f compose.yaml -f compose.production.yaml \
-pull
-
-# Adjust the timeout to the slowest expected startup; avoid waiting forever.
-docker compose \
---env-file .env.production \
--f compose.yaml -f compose.production.yaml \
-up -d --wait --wait-timeout 120
-
-docker compose \
---env-file .env.production \
--f compose.yaml -f compose.production.yaml \
-ps
-
-# Remove containers/networks only when intended. Do not routinely add -v:
-
-# -v deletes named volumes declared by this Compose project, including db_data.
-
-docker compose \
---env-file .env.production \
--f compose.yaml -f compose.production.yaml \
-down
+# Inspect recent application and database logs.
+docker compose -f compose.yaml -f compose.dev.yaml logs --tail=100 app db
 ```
 
-Be cautious about storing `docker compose config` output as a public CI artifact: it reveals resolved configuration and will expose anything that was mistakenly supplied as an environment variable.
+Before committing documentation changes, also preview the rendered Markdown and check the table of contents, code fences, and links on GitHub or Gitea.
+
+### Common problems
+
+| Symptom | Likely cause | Recovery |
+| --- | --- | --- |
+| A required-image error appears during production validation | `APP_IMAGE` or `POSTGRES_IMAGE` is unset | Set both in `.env.production` and pass that file with `--env-file`. Replace every digest placeholder with a reviewed value. |
+| `.env` values are missing inside a container | Compose used the file for interpolation, not container injection | Pass required non-secret values explicitly with `environment` or `env_file`. Keep secrets in a secret mechanism instead. |
+| `app` remains unhealthy | `/app/healthcheck` is absent, not executable, too slow, or does not test readiness | Replace the example command, rebuild the image, and inspect `docker compose logs app`. |
+| `develop.watch` fails | Compose is older than 2.22.0, required image tools are missing, or the sync target is not writable | Upgrade Compose; install `stat`, `mkdir`, and `rmdir`; fix image ownership and permissions. |
+| A secret cannot be read | Host ownership or mode does not match the container user | Adjust source-file ownership and permissions for your rootful or rootless Docker setup. Service-level `uid`, `gid`, and `mode` do not change a file-backed secret bind mount. |
+| The application port is already allocated | Another process uses the selected host port | Set a different `APP_PORT` in `.env` or stop the conflicting process after identifying it. |
+| Database credentials stop matching after environment changes | Initialization variables do not reprovision an existing volume | Provision or rotate roles and credentials explicitly, then update both secret files and recreate their consumers. |
+| PostgreSQL rejects an existing data directory after an image change | A different major version is using incompatible data | Restore the previous compatible image or follow a tested backup and `pg_upgrade` procedure. Do not overwrite the only data copy. |
 
 ## Production review questions
 
 - Are all application and third-party images approved, scanned, and pinned? Is there a controlled update and rollback process?
 - Does every container run with the minimum user, capabilities, filesystem access, devices, and network access it needs?
-- Are secrets injected only into services that require them, excluded from source/build contexts, readable only by intended users, and rotatable?
+- Are secrets injected only into services that require them, excluded from source and build contexts, readable only by intended users, and rotatable?
 - Has the example PostgreSQL superuser been replaced for application access by a separate least-privileged role and secret? Are major-version upgrades planned and tested separately from routine deployments?
 - Does each health check test actual readiness without creating excessive load or depending on an external service that could cause cascading failure?
-- Does the application reconnect after database/network failures instead of relying only on startup ordering?
+- Does the application reconnect after database and network failures instead of relying only on startup ordering?
 - Are persistent volumes covered by encrypted, off-host backups with tested restores and retention?
 - Are CPU, memory, PID, disk, and log usage bounded and monitored? Are alerts actionable?
 - Are graceful shutdown, database migrations, deployment, rollback, and disaster recovery rehearsed?
 - Are TLS, firewall rules, host hardening, audit logging, and operating-system updates handled outside Compose?
 - Has the final `docker compose config` output been reviewed, including all overrides and remote references?
+
+## Contributing
+
+Improvements are welcome when they make the template more accurate, secure, usable, or maintainable. Follow the repository's [documentation best-practices guide](https://github.com/miiko1/Documentation-best-practices-for-GitHub-and-Gitea) when changing this README.
+
+1. Open an issue for substantial restructuring or when the intended outcome is unclear.
+2. Keep corrections focused and separate factual fixes from stylistic rewrites when practical.
+3. Validate every changed Compose example and command in a clean, clearly described test setup.
+4. Check heading hierarchy, table-of-contents anchors, code fences, relative links, and external references.
+5. Describe the reader problem and list the validation performed in the pull request.
+6. Never include real credentials, tokens, private hostnames, personal data, or confidential information in examples or issue reports.
+
+## Support
+
+Use [GitHub Issues](https://github.com/miiko1/docker-compose-best-practices/issues) to report documentation errors, request improvements, or ask questions about the template. Include the relevant Compose version, host environment, redacted configuration, command, and observed error. Remove secrets and personal data before posting logs or `docker compose config` output.
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0 or later](LICENSE).
 
 ## Official references
 
